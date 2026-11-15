@@ -767,6 +767,12 @@ impl DistributedRuntime {
         Ok(())
     }
 
+    /// Whether this process dials some workers itself, having registered a
+    /// dispatch for `TransportType::Grpc` instances.
+    pub fn has_grpc_dispatch(&self) -> bool {
+        !self.grpc_dispatches.lock().is_empty()
+    }
+
     /// The dispatch registered for `TransportType::Grpc` instances with request
     /// type `T` and response type `U`. A component that reads per-worker state
     /// differently for engines this process dials itself, such as a router
