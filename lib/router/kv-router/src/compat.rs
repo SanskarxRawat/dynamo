@@ -851,8 +851,6 @@ pub mod protocols {
         note = "moved to dynamo_kv_indexer::RouterHintSourceMetadata; removed in 1.10.0"
     )]
     pub type RouterHintSourceMetadata = dynamo_kv_indexer::RouterHintSourceMetadata;
-    pub use dynamo_scheduler::RouterRequest;
-    pub use dynamo_scheduler::RouterResponse;
     #[deprecated(
         since = "1.8.0",
         note = "moved to dynamo_scheduler::RoutingConstraints; removed in 1.10.0"
