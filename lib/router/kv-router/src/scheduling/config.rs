@@ -996,14 +996,6 @@ impl KvRouterConfig {
             .map(|selection| selection.label().to_owned()))
     }
 
-    #[cfg_attr(
-        not(all(
-            feature = "ingest-zmq",
-            feature = "replica-sync-zmq",
-            feature = "peer-recovery"
-        )),
-        allow(dead_code)
-    )]
     pub(crate) fn selected_worker_selection_policy_instances(
         &self,
     ) -> Result<WorkerSelectionPolicySelections, WorkerSelectionPolicyConfigError> {
