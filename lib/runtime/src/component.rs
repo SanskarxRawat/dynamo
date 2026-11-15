@@ -80,12 +80,19 @@ pub enum TransportType {
     #[serde(rename = "nats_tcp")]
     Nats(String),
     Tcp(String),
+    /// An engine this process dials over its native gRPC API, through the
+    /// dispatch registered with
+    /// [`DistributedRuntime::register_grpc_dispatch`](crate::DistributedRuntime::register_grpc_dispatch);
+    /// no request-plane server exists for it.
+    Grpc(String),
 }
 
 impl TransportType {
     pub fn address(&self) -> &str {
         match self {
-            TransportType::Nats(address) | TransportType::Tcp(address) => address,
+            TransportType::Nats(address)
+            | TransportType::Tcp(address)
+            | TransportType::Grpc(address) => address,
         }
     }
 }

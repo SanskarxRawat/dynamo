@@ -40,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 
 type EndpointDiscoverySourceMap = HashMap<Endpoint, Weak<EndpointDiscoverySource>>;
 type RoutingOccupancyMap = HashMap<Endpoint, Weak<RoutingOccupancyState>>;
+/// A type-erased `Arc<dyn StreamingDispatch<T, U>>`.
+type GrpcDispatchEntry = Arc<dyn std::any::Any + Send + Sync>;
 
 fn parse_tcp_response_stream_port(value: Option<&str>) -> Result<u16, PipelineError> {
     let Some(port) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -166,6 +168,9 @@ pub struct DistributedRuntime {
 
     endpoint_discovery_sources: Arc<tokio::sync::Mutex<EndpointDiscoverySourceMap>>,
     routing_occupancy_states: Arc<tokio::sync::Mutex<RoutingOccupancyMap>>,
+    /// Final hops for `TransportType::Grpc` instances, one per request and response
+    /// type; see [`Self::register_grpc_dispatch`].
+    grpc_dispatches: Arc<parking_lot::Mutex<HashMap<std::any::TypeId, GrpcDispatchEntry>>>,
 
     // Health Status
     system_health: Arc<parking_lot::Mutex<SystemHealth>>,
@@ -335,6 +340,7 @@ impl DistributedRuntime {
             component_registry,
             endpoint_discovery_sources: Arc::new(Mutex::new(HashMap::new())),
             routing_occupancy_states: Arc::new(Mutex::new(HashMap::new())),
+            grpc_dispatches: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             metrics_registry: crate::MetricsRegistry::new(),
             system_health,
             request_plane,
@@ -716,6 +722,53 @@ impl DistributedRuntime {
     /// the task has finished.
     pub fn register_graceful_task(&self) -> crate::utils::GracefulTaskGuard {
         self.runtime.graceful_shutdown_tracker().register_task()
+    }
+
+    /// Reach every `TransportType::Grpc` instance of this runtime's routers with
+    /// request type `T` and response type `U` through `dispatch`.
+    ///
+    /// Engines this process dials itself, rather than reaching them over the
+    /// request plane, register as `Grpc` instances. A router built without an
+    /// explicit dispatch sends their requests here and every other instance's
+    /// over the request plane. Fails if a dispatch for `T` and `U` is already
+    /// registered.
+    pub fn register_grpc_dispatch<T, U>(
+        &self,
+        dispatch: Arc<dyn crate::pipeline::StreamingDispatch<T, U>>,
+    ) -> Result<()>
+    where
+        T: crate::engine::Data + serde::Serialize,
+        U: crate::engine::Data
+            + for<'de> serde::Deserialize<'de>
+            + crate::protocols::maybe_error::MaybeError,
+    {
+        let mut dispatches = self.grpc_dispatches.lock();
+        let key = std::any::TypeId::of::<(T, U)>();
+        anyhow::ensure!(
+            !dispatches.contains_key(&key),
+            "a gRPC dispatch for these request and response types is already registered"
+        );
+        dispatches.insert(key, Arc::new(dispatch));
+        Ok(())
+    }
+
+    /// The dispatch registered for `TransportType::Grpc` instances with request
+    /// type `T` and response type `U`. A component that reads per-worker state
+    /// differently for engines this process dials itself, such as a router
+    /// choosing where KV events come from, checks this once when it is built,
+    /// so the dispatch must be registered before those workers are published.
+    pub fn grpc_dispatch<T, U>(&self) -> Option<Arc<dyn crate::pipeline::StreamingDispatch<T, U>>>
+    where
+        T: crate::engine::Data + serde::Serialize,
+        U: crate::engine::Data
+            + for<'de> serde::Deserialize<'de>
+            + crate::protocols::maybe_error::MaybeError,
+    {
+        self.grpc_dispatches
+            .lock()
+            .get(&std::any::TypeId::of::<(T, U)>())?
+            .downcast_ref::<Arc<dyn crate::pipeline::StreamingDispatch<T, U>>>()
+            .cloned()
     }
 
     pub(crate) fn routing_occupancy_states(&self) -> Arc<Mutex<RoutingOccupancyMap>> {

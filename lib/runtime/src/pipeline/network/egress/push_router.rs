@@ -644,6 +644,102 @@ async fn addressed_router(endpoint: &Endpoint) -> anyhow::Result<Arc<AddressedPu
     AddressedPushRouter::from_runtime_provider(endpoint).await
 }
 
+/// The default final hop: the request plane, except for instances that
+/// advertise `TransportType::Grpc`, which go to the dispatch registered with
+/// [`DistributedRuntime::register_grpc_dispatch`](crate::DistributedRuntime::register_grpc_dispatch).
+struct TransportDispatch<T, U> {
+    request_plane: Arc<AddressedPushRouter>,
+    drt: crate::DistributedRuntime,
+    grpc: std::sync::OnceLock<Arc<dyn StreamingDispatch<T, U>>>,
+}
+
+impl<T, U> TransportDispatch<T, U>
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+{
+    fn new(request_plane: Arc<AddressedPushRouter>, drt: crate::DistributedRuntime) -> Self {
+        Self {
+            request_plane,
+            drt,
+            grpc: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn registered_grpc(&self) -> Option<Arc<dyn StreamingDispatch<T, U>>> {
+        if let Some(dispatch) = self.grpc.get() {
+            return Some(dispatch.clone());
+        }
+        let dispatch = self.drt.grpc_dispatch::<T, U>()?;
+        Some(self.grpc.get_or_init(|| dispatch).clone())
+    }
+
+    fn grpc(&self, instance_id: u64) -> Result<Arc<dyn StreamingDispatch<T, U>>, Error> {
+        self.registered_grpc().ok_or_else(|| {
+            DynamoError::builder()
+                .error_type(ErrorType::CannotConnect)
+                .message(format!(
+                    "instance {instance_id} is reached over gRPC, but no gRPC dispatch is registered"
+                ))
+                .build()
+                .into()
+        })
+    }
+}
+
+fn is_grpc(instance: &Instance) -> bool {
+    matches!(instance.transport, crate::component::TransportType::Grpc(_))
+}
+
+#[async_trait]
+impl<T, U> StreamingDispatch<T, U> for TransportDispatch<T, U>
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+{
+    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
+        match request.instance().filter(|instance| is_grpc(instance)) {
+            Some(instance) => self.grpc(instance.id())?.generate(request).await,
+            None => StreamingDispatch::<T, U>::generate(self.request_plane.as_ref(), request).await,
+        }
+    }
+
+    async fn generate_bidirectional(
+        &self,
+        instance: Instance,
+        address: String,
+        input: ManyIn<T>,
+    ) -> Result<ManyOut<U>, Error> {
+        if is_grpc(&instance) {
+            self.grpc(instance.id())?
+                .generate_bidirectional(instance, address, input)
+                .await
+        } else {
+            StreamingDispatch::<T, U>::generate_bidirectional(
+                self.request_plane.as_ref(),
+                instance,
+                address,
+                input,
+            )
+            .await
+        }
+    }
+
+    async fn on_instance_removed(&self, id: &EndpointInstanceId) {
+        StreamingDispatch::<T, U>::on_instance_removed(self.request_plane.as_ref(), id).await;
+        if let Some(grpc) = self.registered_grpc() {
+            grpc.on_instance_removed(id).await;
+        }
+    }
+
+    async fn on_instance_added(&self, id: &EndpointInstanceId) {
+        StreamingDispatch::<T, U>::on_instance_added(self.request_plane.as_ref(), id).await;
+        if let Some(grpc) = self.registered_grpc() {
+            grpc.on_instance_added(id).await;
+        }
+    }
+}
+
 /// Optional capabilities of a [`PushRouter`], for [`PushRouter::from_client_with_options`].
 ///
 /// Every named constructor on [`PushRouter`] is a shorthand for one of these.
@@ -653,7 +749,9 @@ pub struct PushRouterOptions<T, U> {
     /// Multimodal embedding-cache state for `RouterMode::DeviceAwareWeighted`.
     pub multimodal_cache_indexer: Option<Arc<dyn MultimodalCacheIndex>>,
     pub multimodal_cache_key_extractor: Option<MultimodalCacheKeyExtractor<T>>,
-    /// A caller-supplied final hop in place of the request plane. Its `ErrorType`
+    /// A caller-supplied final hop for every instance. Without one, the router
+    /// reaches `TransportType::Grpc` instances through the runtime's registered
+    /// gRPC dispatch and all others over the request plane. Its `ErrorType`
     /// mapping drives report-down, overload and migration as usual.
     pub dispatch: Option<Arc<dyn StreamingDispatch<T, U>>>,
     /// Report transient worker errors to discovery (`report_instance_down`) and
@@ -757,7 +855,10 @@ where
         // Type-erase to the seam so discovery-removal cleanup runs through it.
         let addressed: Arc<dyn StreamingDispatch<T, U>> = match dispatch {
             Some(dispatch) => dispatch,
-            None => addressed_router(&client.endpoint).await?,
+            None => Arc::new(TransportDispatch::new(
+                addressed_router(&client.endpoint).await?,
+                client.endpoint.drt().clone(),
+            )),
         };
 
         // Start worker monitor if provided and in dynamic mode
@@ -1800,6 +1901,7 @@ where
                         (tcp_endpoint.clone(), "transport.tcp.request")
                     }
                     TransportType::Nats(subject) => (subject.clone(), "transport.nats.request"),
+                    TransportType::Grpc(endpoint) => (endpoint.clone(), "transport.grpc.request"),
                 };
                 (addr, kind, instance)
             })
@@ -3794,6 +3896,136 @@ mod tests {
         assert!(
             poll_until(|| dispatch.added.lock().unwrap().len() > adds_before).await,
             "on_instance_added (re-registration) not delivered to the supplied dispatch"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Register this runtime's own instance of `endpoint` as one reached over gRPC.
+    async fn register_grpc_instance(drt: &DistributedRuntime, endpoint: &Endpoint) {
+        let id = endpoint.id();
+        drt.discovery()
+            .register(crate::discovery::DiscoverySpec::Endpoint {
+                namespace: id.namespace,
+                component: id.component,
+                endpoint: id.name,
+                transport: crate::component::TransportType::Grpc("http://engine:30001".to_string()),
+                device_type: None,
+                request_plane_codec: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A router built without a dispatch reaches gRPC instances through the
+    /// runtime's registered gRPC dispatch, with its lifecycle hooks.
+    #[tokio::test]
+    async fn grpc_instances_use_the_registered_grpc_dispatch() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_grpc_dispatch".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+        register_grpc_instance(&drt, &endpoint).await;
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
+
+        let dispatch = Arc::new(RecordingDispatch::default());
+        drt.register_grpc_dispatch::<u64, TestResponse>(dispatch.clone())
+            .unwrap();
+        assert!(
+            drt.register_grpc_dispatch::<u64, TestResponse>(dispatch.clone())
+                .is_err(),
+            "a second gRPC dispatch for the same types must be refused"
+        );
+        let router = PushRouter::<u64, TestResponse>::from_client_with_options(
+            client.clone(),
+            RouterMode::RoundRobin,
+            PushRouterOptions {
+                selectors: Some(test_selectors()),
+                ..PushRouterOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut stream = router.generate(SingleIn::new(7u64)).await.unwrap();
+        while stream.next().await.is_some() {}
+        {
+            let unary = dispatch.unary.lock().unwrap();
+            assert_eq!(unary.len(), 1, "one unary dispatch expected");
+            assert_eq!(unary[0].0, 7);
+            assert_eq!(unary[0].1, "http://engine:30001");
+            assert_eq!(unary[0].2, Some(instance_id));
+        }
+
+        let input: ManyIn<u64> =
+            Context::new(RequestStream::new(Box::pin(tokio_stream::iter(vec![
+                1u64, 2u64,
+            ]))));
+        let mut stream = router.generate(input).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            dispatch.bidi.lock().unwrap()[..],
+            [("http://engine:30001".to_string(), instance_id)]
+        );
+
+        assert!(
+            poll_until(|| dispatch.added.lock().unwrap().contains(&instance_id)).await,
+            "on_instance_added not delivered to the gRPC dispatch"
+        );
+        drt.discovery()
+            .unregister(crate::discovery::DiscoveryInstance::Endpoint(
+                client.wait_for_instances().await.unwrap()[0].clone(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            poll_until(|| dispatch.removed.lock().unwrap().contains(&instance_id)).await,
+            "on_instance_removed not delivered to the gRPC dispatch"
+        );
+
+        rt.shutdown();
+    }
+
+    /// A gRPC instance with no registered gRPC dispatch cannot be reached.
+    #[tokio::test]
+    async fn grpc_instances_without_a_registered_dispatch_cannot_connect() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_grpc_dispatch_missing".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+        register_grpc_instance(&drt, &endpoint).await;
+        client.wait_for_instances().await.unwrap();
+
+        let router = PushRouter::<u64, TestResponse>::from_client_with_options(
+            client,
+            RouterMode::RoundRobin,
+            PushRouterOptions {
+                selectors: Some(test_selectors()),
+                ..PushRouterOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let Err(error) = router.generate(SingleIn::new(1u64)).await else {
+            panic!("no dispatch is registered for gRPC instances");
+        };
+        assert!(
+            match_error_chain(error.as_ref(), &[ErrorType::CannotConnect], &[]),
+            "{error}"
         );
 
         rt.shutdown();
