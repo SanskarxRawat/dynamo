@@ -44,6 +44,19 @@ pub struct Environment {
 
 impl Environment {
     pub async fn new() -> Self {
+        Self::with_discovery(|root| DistributedConfig {
+            discovery_backend: DiscoveryBackend::KvStore(Selector::File(root.join("discovery"))),
+            ..DistributedConfig::process_local()
+        })
+        .await
+    }
+
+    /// An environment whose discovery is in-memory, as a direct frontend's is.
+    pub async fn process_local() -> Self {
+        Self::with_discovery(|_| DistributedConfig::process_local()).await
+    }
+
+    async fn with_discovery(config: impl FnOnce(&std::path::Path) -> DistributedConfig) -> Self {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("model");
         std::fs::create_dir(&model).unwrap();
@@ -58,17 +71,10 @@ impl Environment {
                 .to_string_lossy()
                 .replace('.', "")
         );
-        let runtime = DistributedRuntime::new(
-            Runtime::from_current().unwrap(),
-            DistributedConfig {
-                discovery_backend: DiscoveryBackend::KvStore(Selector::File(
-                    root.path().join("discovery"),
-                )),
-                ..DistributedConfig::process_local()
-            },
-        )
-        .await
-        .unwrap();
+        let runtime =
+            DistributedRuntime::new(Runtime::from_current().unwrap(), config(root.path()))
+                .await
+                .unwrap();
         Self {
             root,
             model: model.to_string_lossy().into_owned(),
@@ -209,6 +215,24 @@ impl Frontend {
     }
 
     pub async fn start_with_migration(env: &Environment, migration_limit: u32) -> Self {
+        Self::start_with(env, migration_limit, RouterMode::RoundRobin, None).await
+    }
+
+    /// A frontend that dials its engines itself through `dispatch`.
+    pub async fn start_direct(
+        env: &Environment,
+        router_mode: RouterMode,
+        dispatch: dynamo_llm::kv_router::LlmDispatch,
+    ) -> Self {
+        Self::start_with(env, 0, router_mode, Some(dispatch)).await
+    }
+
+    async fn start_with(
+        env: &Environment,
+        migration_limit: u32,
+        router_mode: RouterMode,
+        direct_dispatch: Option<dynamo_llm::kv_router::LlmDispatch>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let service = HttpService::builder()
@@ -217,11 +241,18 @@ impl Frontend {
             .enable_cmpl_endpoints(true)
             .build()
             .unwrap();
+        if let Some(dispatch) = direct_dispatch {
+            service
+                .state()
+                .manager()
+                .set_direct_dispatch(dispatch)
+                .unwrap();
+        }
         let watcher = Arc::new(ModelWatcher::new(
             env.runtime.clone(),
             service.state().manager_clone(),
             RouterConfig {
-                router_mode: RouterMode::RoundRobin,
+                router_mode,
                 ..Default::default()
             },
             migration_limit,
@@ -257,6 +288,14 @@ impl Frontend {
 
     pub fn generate(&self, model: &str, is_streaming: bool) -> reqwest::RequestBuilder {
         self.generate_tokens(model, is_streaming, 3)
+    }
+
+    /// A non-streaming completion of `prompt`.
+    pub fn complete(&self, model: &str, prompt: &str) -> reqwest::RequestBuilder {
+        self.client.post(&self.url).json(&serde_json::json!({
+            "model": model, "prompt": prompt, "max_tokens": 2,
+            "temperature": 0, "ignore_eos": true,
+        }))
     }
 
     pub fn generate_tokens(
